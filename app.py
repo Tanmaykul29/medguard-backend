@@ -1,56 +1,59 @@
-from flask import Flask, render_template, request, jsonify
-from flask_cors import CORS
 import os
-from ultralytics import YOLO
-from PIL import Image
 import torch
 import pandas as pd
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-
 from flask import Flask, request, jsonify, session
-from flask_bcrypt import Bcrypt #pip install Flask-Bcrypt = https://pypi.org/project/Flask-Bcrypt/
-from flask_cors import CORS, cross_origin #ModuleNotFoundError: No module named 'flask_cors' = pip install Flask-Cors
+from flask_bcrypt import Bcrypt
+from flask_cors import CORS
+from PIL import Image
+from ultralytics import YOLO
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from models import db, User
 
-app = Flask(__name__)
-CORS(app)
-app.config['UPLOAD_FOLDER'] = 'static/images/'
+# Base directory for safe file pathing
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app.config['SECRET_KEY'] = 'cairocoders-ednalan'
+# Flask App Initialization
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'static', 'images')
+app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY", "default-dev-secret")
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///flaskdb.db'
- 
-SQLALCHEMY_TRACK_MODIFICATIONS = False
-SQLALCHEMY_ECHO = True
-  
-bcrypt = Bcrypt(app) 
-CORS(app, supports_credentials=True)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ECHO'] = True
+
+# Initialize Extensions
+CORS(app, supports_credentials=True)  # You can add origins=["https://your-frontend.azurestaticapps.net"]
+bcrypt = Bcrypt(app)
 db.init_app(app)
-  
+
+# Ensure upload directory exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Initialize DB
 with app.app_context():
     db.create_all()
 
-
-yolo_model = YOLO("Model/best.pt")
+# Load Models and Data
+yolo_model = YOLO(os.path.join(BASE_DIR, "Model", "best.pt"))
 processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-stage1")
 trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-stage1")
+df = pd.read_csv(os.path.join(BASE_DIR, 'dataset', 'allMedicines.csv'))
 
-df = pd.read_csv('dataset/allMedicines.csv')
+# Helper Functions
 def extract_text(image_path):
-
     results = yolo_model.predict(source=image_path, conf=0.25, hide_labels=True)
     boxes = results[0].boxes.xyxy.cpu().numpy()
-    scores = results[0].boxes.conf.cpu().numpy()  # Confidence scores
-    labels = results[0].boxes.cls.cpu().numpy()  # Class IDs
+    scores = results[0].boxes.conf.cpu().numpy()
+    labels = results[0].boxes.cls.cpu().numpy()
     image = Image.open(image_path)
     extracted_texts = []
     label_map = {0: "Company", 1: "Generic", 2: "Manufacturer"}
     mydict = {}
+
     for i, box in enumerate(boxes):
         x_min, y_min, x_max, y_max = map(int, box)
         label_id = int(labels[i])
         label = label_map.get(label_id, "Unknown")
         cropped_image = image.crop((x_min, y_min, x_max, y_max))
-
         pixel_values = processor(cropped_image, return_tensors="pt").pixel_values
 
         with torch.no_grad():
@@ -58,93 +61,74 @@ def extract_text(image_path):
 
         extracted_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         extracted_texts.append(extracted_text)
-        mydict[label]=extracted_text
+        mydict[label] = extracted_text
 
     return extracted_texts, mydict
 
 def check_fraudulent_product(mydict):
     names = df['name']
-    found=False
+    found = False
+
     for label, value in mydict.items():
-        value=value.lower()
+        value = value.lower()
         arr = value.split(' ')
-        print(f"Label: {label}, Value: {value}")
-        if label=="Company":
-            print("inside label==company loop")
-            print(f"list_value: {arr}")
-            filtered_arr = [s for s in arr if "mg" not in s and "md" not in s and not any(
-                char.isdigit() for char in s) and "Tablet" not in s]
-            print(f"filtered_arr: {filtered_arr}")
+        if label == "Company":
+            filtered_arr = [s for s in arr if "mg" not in s and "md" not in s and not any(char.isdigit() for char in s) and "tablet" not in s]
             for name in names:
                 for ite in filtered_arr:
                     if ite in name.lower():
-                        found=True
+                        found = True
                         break
-                if found==True:
+                if found:
                     break
     return found
 
-
+# API Routes
 @app.route("/signup", methods=["POST"])
 def signup():
-    email = request.json["email"]
-    password = request.json["password"]
- 
-    user_exists = User.query.filter_by(email=email).first() is not None
- 
-    if user_exists:
+    email = request.json.get("email")
+    password = request.json.get("password")
+
+    if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already exists"}), 409
-     
+
     hashed_password = bcrypt.generate_password_hash(password)
     new_user = User(email=email, password=hashed_password)
     db.session.add(new_user)
     db.session.commit()
- 
     session["user_id"] = new_user.id
- 
-    return jsonify({
-        "id": new_user.id,
-        "email": new_user.email
-    })
- 
+
+    return jsonify({"id": new_user.id, "email": new_user.email})
+
 @app.route("/login", methods=["POST"])
 def login_user():
-    email = request.json["email"]
-    password = request.json["password"]
-  
+    email = request.json.get("email")
+    password = request.json.get("password")
+
     user = User.query.filter_by(email=email).first()
-  
-    if user is None:
-        return jsonify({"error": "Unauthorized Access"}), 401
-  
-    if not bcrypt.check_password_hash(user.password, password):
+
+    if not user or not bcrypt.check_password_hash(user.password, password):
         return jsonify({"error": "Unauthorized"}), 401
-      
+
     session["user_id"] = user.id
-  
-    return jsonify({
-        "id": user.id,
-        "email": user.email
-    })
+    return jsonify({"id": user.id, "email": user.email})
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided.'}), 400
+
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No selected file.'}), 400
-    if file:
-        image_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-        file.save(image_path)
-        extracted_texts, mydict = extract_text(image_path)
-        fraud_check_results = check_fraudulent_product(mydict)
-        return jsonify({'texts': extracted_texts, 'fraud_check': fraud_check_results})
 
+    image_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    file.save(image_path)
+    extracted_texts, mydict = extract_text(image_path)
+    fraud_check_results = check_fraudulent_product(mydict)
 
-if __name__ == '__main__':
-    if not os.path.exists(app.config['UPLOAD_FOLDER']):
-        os.makedirs(app.config['UPLOAD_FOLDER'])
-    app.run(debug=True)
+    return jsonify({'texts': extracted_texts, 'fraud_check': fraud_check_results})
 
-
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"}), 200
