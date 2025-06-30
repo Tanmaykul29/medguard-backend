@@ -83,7 +83,7 @@ def check_fraudulent_product(mydict):
                     break
     return found
 
-# API Routes
+
 @app.route("/signup", methods=["POST"])
 def signup():
     email = request.json.get("email")
