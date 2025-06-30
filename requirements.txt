@@ -6,4 +6,3 @@ pandas==2.2.3
 torch==2.2.2
 transformers==4.37.2
 ultralytics==8.3.11
-gunicorn
